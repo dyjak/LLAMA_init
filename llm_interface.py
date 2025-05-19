@@ -1,155 +1,239 @@
 import os
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any, Generator, Union
 
 from llm_core import SimpleLLM
-import config
+from config import config  # Importujemy instancję Config, nie moduł
 
 
 class SimpleLLMInterface:
     def __init__(self):
-        """interfejs użytkownika dla simplellm."""
+        """Interfejs użytkownika dla SimpleLLM."""
         self.model = None
-        self.model_path = None
         self.history = []
+        self.current_model_params = {}
 
     def load_model(
             self,
-            model_path: Optional[str] = None,
-            repo_id: Optional[str] = None,
-            filename: Optional[str] = None,
+            model_path: str,
             **kwargs
     ) -> bool:
         """
-        ładuje model z podanej ścieżki lub z predefiniowanego repozytorium.
+        Ładuje model z podanej ścieżki.
 
-        args:
+        Args:
             model_path: ścieżka do lokalnego pliku modelu
-            repo_id: id repozytorium dla modeli predefiniowanych
-            filename: nazwa pliku w repozytorium
-            **kwargs: dodatkowe parametry dla modelu (context_size, n_gpu_layers, itd.)
+            **kwargs: dodatkowe parametry dla modelu
+
+        Returns:
+            True jeśli model został pomyślnie załadowany, False w przeciwnym razie
         """
         try:
-            if repo_id and filename:
-                self.model = SimpleLLM(
-                    repo_id=repo_id,
-                    filename=filename,
-                    verbose=True,
-                    **kwargs
-                )
-                print(f"Model załadowany: {filename} z repozytorium {repo_id}")
-            elif model_path:
-                self.model = SimpleLLM(
-                    model_path=model_path,
-                    verbose=True,
-                    **kwargs
-                )
-                self.model_path = model_path
-                print(f"Model załadowany: {self.model.model_name}")
-            else:
-                print("Musisz podać ścieżkę do modelu lub dane repozytorium")
+            if not os.path.exists(model_path):
+                print(f"Nie znaleziono pliku modelu: {model_path}")
                 return False
+
+            # Zapisz ścieżkę do ostatnio używanych modeli
+            recent_models = config.config.get("recent_models", [])
+            if model_path in recent_models:
+                recent_models.remove(model_path)
+            recent_models.insert(0, model_path)
+            # Ogranicz listę do 10 ostatnich modeli
+            config.config["recent_models"] = recent_models[:10]
+
+            # Aktualizuj ostatni używany katalog
+            config.config["last_models_dir"] = os.path.dirname(model_path)
+
+            # Załaduj model z parametrami
+            # Pobierz domyślne parametry z konfiguracji i nadpisz je przekazanymi argumentami
+            model_params = config.config.get("model", {}).copy()
+            model_params.update(kwargs)
+
+            # Zapisz aktualne parametry modelu
+            self.current_model_params = model_params
+
+            # Utwórz instancję modelu
+            self.model = SimpleLLM(
+                model_path=model_path,
+                context_size=model_params.get("context_size", 4096),
+                n_gpu_layers=model_params.get("n_gpu_layers", -1),
+                n_threads=model_params.get("n_cpu_threads"),
+                batch_size=model_params.get("batch_size", 512),
+                f16_kv=model_params.get("f16_kv", True),
+                logits_all=model_params.get("logits_all", False),
+                vocab_only=model_params.get("vocab_only", False),
+                use_mmap=model_params.get("use_mmap", True),
+                use_mlock=model_params.get("use_mlock", False),
+                embedding=model_params.get("embedding", False),
+                rope_scaling_type=model_params.get("rope_scaling_type"),
+                rope_freq_base=model_params.get("rope_freq_base", 10000.0),
+                rope_freq_scale=model_params.get("rope_freq_scale", 1.0),
+                verbose=True
+            )
+
+            # Zapisz konfigurację
+            config.save_config()
 
             model_info = self.model.get_info()
             print(f"Informacje o modelu:")
             for key, value in model_info.items():
                 print(f"  {key}: {value}")
             return True
+
         except Exception as e:
             print(f"Błąd podczas ładowania modelu: {e}")
+            import traceback
+            print(traceback.format_exc())
             return False
 
     def chat(
             self,
             prompt: str,
-            system_prompt: str = config.DEFAULT_SYSTEM_PROMPT,
-            max_tokens: int = config.DEFAULT_MAX_TOKENS,
-            temperature: float = config.DEFAULT_TEMPERATURE,
-            stream: bool = True
-    ) -> str:
-        """przeprowadza interakcję z modelem w stylu czatu."""
+            system_prompt: str = None,
+            **kwargs
+    ) -> Union[str, Generator[str, None, None]]:
+        """
+        Przeprowadza interakcję z modelem w stylu czatu.
+
+        Args:
+            prompt: Tekst wprowadzony przez użytkownika
+            system_prompt: Prompt systemowy definiujący zachowanie modelu
+            **kwargs: Dodatkowe parametry generowania
+
+        Returns:
+            Wygenerowana odpowiedź lub generator odpowiedzi
+        """
         if self.model is None:
             print("Najpierw załaduj model używając load_model()")
             return ""
 
-        # formatowanie prompta zgodnie z formatem instrukcji dla modeli llama
+        # Jeśli nie podano system_prompt, użyj domyślnego z konfiguracji
+        if system_prompt is None:
+            system_prompt = config.config.get("system_prompt", "Jesteś pomocnym asystentem AI.")
+
+        # Formatowanie prompta zgodnie z formatem instrukcji dla modeli
         formatted_prompt = f"""<s>[INST] {system_prompt}
 
 {prompt} [/INST]"""
 
-        if stream:
-            print("\nOdpowiedź:")
-            full_response = ""
-            for chunk in self.model.generate(
-                    formatted_prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stream=True
-            ):
-                print(chunk, end="", flush=True)
-                full_response += chunk
-            print("\n")
-            return full_response
-        else:
-            response = self.model.generate(
-                formatted_prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stream=False
-            )
-            print(f"\nOdpowiedź:\n{response}\n")
-            return response
+        # Pobierz parametry generowania z konfiguracji i nadpisz je przekazanymi argumentami
+        generation_params = config.config.get("generation", {}).copy()
+        generation_params.update(kwargs)
+
+        # Usuń parametry, które nie są używane przez model.generate()
+        stream = generation_params.pop("stream", False)
+
+        return self.model.generate(
+            formatted_prompt,
+            stream=stream,
+            **generation_params
+        )
 
     def complete(
             self,
             prompt: str,
-            max_tokens: int = config.DEFAULT_MAX_TOKENS,
-            temperature: float = config.DEFAULT_TEMPERATURE,
-            echo: bool = False,
-            stream: bool = True
+            **kwargs
     ):
-        """przeprowadza proste uzupełnienie tekstu bez formatowania czatu."""
+        """
+        Przeprowadza proste uzupełnienie tekstu bez formatowania czatu.
+
+        Args:
+            prompt: Tekst wprowadzony przez użytkownika
+            **kwargs: Dodatkowe parametry generowania
+
+        Returns:
+            Wygenerowana odpowiedź lub generator odpowiedzi
+        """
         if self.model is None:
             print("Najpierw załaduj model używając load_model()")
             return ""
 
-        if stream:
-            print("\nWyjście:")
-            full_response = ""
-            for chunk in self.model.generate(
-                    prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    echo=echo,
-                    stream=True
-            ):
-                print(chunk, end="", flush=True)
-                full_response += chunk
-            print("\n")
-            return full_response
-        else:
-            output = self.model.generate(
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                echo=echo,
-                stream=False
-            )
+        # Pobierz parametry generowania z konfiguracji i nadpisz je przekazanymi argumentami
+        generation_params = config.config.get("generation", {}).copy()
+        generation_params.update(kwargs)
 
-            if isinstance(output, dict):
-                print(f"\nWyjście:\n{output['choices'][0]['text']}\n")
-                return output
-            else:
-                print(f"\nWyjście:\n{output}\n")
-                return output
+        return self.model.generate(
+            prompt,
+            **generation_params
+        )
 
-    def find_local_models(self, models_dir: str = config.DEFAULT_MODELS_DIR) -> List[Path]:
-        """wyszukuje lokalne modele w formacie gguf."""
+    def find_local_models(self, models_dir: str = None) -> List[Path]:
+        """
+        Wyszukuje lokalne modele w formacie GGUF.
+
+        Args:
+            models_dir: Katalog z modelami
+
+        Returns:
+            Lista ścieżek do znalezionych modeli
+        """
+        if models_dir is None:
+            models_dir = config.config.get("last_models_dir", os.path.expanduser("~/models"))
+
         if not os.path.exists(models_dir):
             return []
 
-        return list(Path(models_dir).glob("*.gguf"))
+        # Wyszukaj pliki GGUF rekurencyjnie we wszystkich podkatalogach
+        gguf_files = []
+        for root, _, files in os.walk(models_dir):
+            for file in files:
+                if file.endswith(".gguf"):
+                    gguf_files.append(Path(os.path.join(root, file)))
 
-    def get_predefined_models(self) -> List[Dict]:
-        """zwraca listę predefiniowanych modeli."""
-        return config.PREDEFINED_MODELS
+        return gguf_files
+
+    def get_recent_models(self) -> List[str]:
+        """
+        Zwraca listę ostatnio używanych modeli.
+
+        Returns:
+            Lista ścieżek do ostatnio używanych modeli
+        """
+        recent_models = config.config.get("recent_models", [])
+        if recent_models is None:
+            return []
+        return recent_models
+
+    def save_current_config(self) -> bool:
+        """
+        Zapisuje aktualną konfigurację.
+
+        Returns:
+            True jeśli zapisano pomyślnie, False w przeciwnym razie
+        """
+        return config.save_config()
+
+    def update_model_params(self, params: Dict[str, Any]) -> None:
+        """
+        Aktualizuje parametry modelu w konfiguracji.
+
+        Args:
+            params: Słownik z nowymi parametrami
+        """
+        if "model" not in config.config:
+            config.config["model"] = {}
+
+        for key, value in params.items():
+            config.config["model"][key] = value
+
+    def update_generation_params(self, params: Dict[str, Any]) -> None:
+        """
+        Aktualizuje parametry generowania w konfiguracji.
+
+        Args:
+            params: Słownik z nowymi parametrami
+        """
+        if "generation" not in config.config:
+            config.config["generation"] = {}
+
+        for key, value in params.items():
+            config.config["generation"][key] = value
+
+    def set_system_prompt(self, system_prompt: str) -> None:
+        """
+        Ustawia domyślny system prompt.
+
+        Args:
+            system_prompt: Nowy system prompt
+        """
+        config.config["system_prompt"] = system_prompt
